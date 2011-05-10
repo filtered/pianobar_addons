@@ -1,0 +1,172 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use DBI;
+use LWP::UserAgent;
+
+#current logged in user
+my $user           = getlogin();
+#store everything in the default config directory
+#using File::HomeDir might be nicer, but requires a dependency not in core perl
+#this is mac-specific, but so is growl
+my $pb_config_dir  = "/Users/$user/.config/pianobar";
+#the fifo named pipe file - must remain unchanged (I think)
+my $ctl_file       = "$pb_config_dir/ctl";
+#location to store album art
+my $cover_art_dir  = "$pb_config_dir/art";
+#sqlite database file
+my $dbf            = "$pb_config_dir/pandora";
+#failover/default image for growl notifications
+my $default_image  = "$pb_config_dir/pandora.png";
+#delete album art older than
+my $max_cache_days = 30;
+#autoban tracks from the same album after $max_album_bans (exclusive)
+my $max_album_bans = 2;
+#maximum number of seconds to wait for album art download
+my $max_image_wait = 2;
+#regex autoban for match in artist, track, or title
+my $auto_ban_regex = qr/(dubstep|steppahs)/i;
+
+my $rec; #record passed from pianobar
+my @args           = @ARGV;
+my @lines          = <STDIN>;
+my $actionline     = shift @args;
+($rec->{action}, $rec->{artist}) = split '=', $actionline;
+for (@args) {
+    my ($key,$value) = split '=';
+    $value =~ s/\n//g; #\n is included in all records
+    $rec->{$key} = $value;
+}
+for (@lines) {
+    my ($key,$value) = split '=';
+    $value =~ s/\n//g; #\n is included in all records
+    $rec->{$key} = $value;
+}
+
+$rec->{delay} = eval{$rec->{songDuration}-$rec->{songPlayed}} || 0;
+
+my $dbh = DBI->connect("dbi:SQLite:dbname=$dbf","","");
+my $cts = "SELECT COUNT(*)
+             FROM sqlite_master
+            WHERE type='table'
+              AND name='log'";
+my $table_exists = $dbh->selectrow_array($cts);
+if (!$table_exists) {
+    my $create_table_sql = "CREATE TABLE log (action varchar(50), artist varchar, title varchar, album varchar,
+                                              station varchar(100), played int(11), duration int(11),
+                                              delay int(11), rating int(11), date_entry timestamp)";
+    $dbh->do($create_table_sql);
+}
+
+my $sql = "INSERT INTO log (action, artist, title, album, station, played, duration, delay, rating, date_entry)
+                    VALUES (?,      ?,      ?,     ?,     ?,       ?,      ?,        ?,     ?,      current_timestamp)";
+my $count = $dbh->selectrow_array("SELECT count(*) from log");
+my $sth = $dbh->prepare($sql);
+$sth->execute(map {$rec->{$_}} qw(action artist title album stationName songPlayed songDuration delay rating));
+if ($rec->{action} =~ /^song(ban|love)/) {
+    my $avg_sql = "SELECT SUM(CASE WHEN action='songban' THEN 1 ELSE 0 END)/(julianday(Datetime('now')) - julianday(MIN(date_entry))) ban,
+                          SUM(CASE WHEN action='songlove' THEN 1 ELSE 0 END)/(julianday(Datetime('now')) - julianday(MIN(date_entry))) love
+                     FROM log";
+    my $dt_sql  = "SELECT COUNT(*) num, action
+                     FROM log
+                    WHERE date_entry LIKE Date('now')||'%'
+                      AND action IN('songban','songlove')
+                 GROUP BY action";
+    my $at_sql  = "SELECT COUNT (*) num, action
+                     FROM log
+                 GROUP BY action";
+    my $avg = $dbh->selectrow_hashref($avg_sql);
+    my $dt  = $dbh->selectall_hashref($dt_sql,'action');
+    my $at  = $dbh->selectall_hashref($at_sql,'action');
+    #workday averages
+    $avg->{workban}  = ($avg->{ban} ||0)*7/5;
+    $avg->{worklove} = ($avg->{love}||0)*7/5;
+    for (qw(ban love workban worklove)) {
+        $avg->{$_} = sprintf '%.02f', $avg->{$_};
+    }
+    for (qw(songban songlove)) {
+        $dt->{$_}->{num} ||= 0;
+        $at->{$_}->{num} ||= 0;
+    }
+    my $action = $rec->{rating} && $rec->{rating} == 1 ? '++' : ' --';
+    my $today_string    = "Today:\n\tBanned: $dt->{songban}->{num}\n\tLoved:  $dt->{songlove}->{num}\n\n\n";
+    my $all_time_string = "All Time:\n\tBanned: $at->{songban}->{num}\n\tLoved:  $at->{songlove}->{num}\n\n\n";
+    my $averages_string = "Averages:\n\tBanned: $avg->{ban}\n\tLoved:  $avg->{love}\n\n\n";
+    my $wkdayavg_string = "Workday Averages:\n\tBanned: $avg->{workban}\n\tLoved:  $avg->{worklove}\n\n\n";
+    my $song = "$rec->{title} : $rec->{artist}";
+    $song =~ s/\n//g;
+    #TODO avg time elapsed to ban/love song?
+    `growlnotify -d 12 -t "$action $song" --image "$default_image" -m "$today_string$all_time_string$averages_string$wkdayavg_string"`;
+}
+
+#on login delete all album art older than $max_cache_days days
+if ($rec->{action} eq 'userlogin') {
+    opendir my $dh, $cover_art_dir or die "Cannot open $cover_art_dir for reading: $!";
+    while (my $file = readdir $dh) {
+        my $filename = "$cover_art_dir/$file";
+        next if !-f $filename || time - (stat _)[10] < (86400 * $max_cache_days);
+        my $t = (stat _)[10];
+        unlink $filename;
+    }
+    closedir $dh;
+}
+#TODO add scrobble support
+if ($rec->{action} eq 'songstart') {
+    my $ban = 0;
+    for (qw(artist title album)) {
+        $ban = 1 if $rec->{$_} =~ /$auto_ban_regex/;
+    }
+    my $absql = "SELECT COUNT(*)
+                   FROM log
+                  WHERE action='songban'
+                    AND album = ?";
+    my $album_bans = $dbh->selectrow_array($absql, undef, $rec->{album});
+    $ban = $album_bans if $album_bans > $max_album_bans;
+    if ($ban) {
+        my $track = "$rec->{title} - $rec->{artist}";
+        $track =~ s/\n//g;
+        print "(i) Auto-banning $track...\n";
+        if (!-e $ctl_file) {
+            `mkfifo $ctl_file`;
+        }
+        print "Could not mkfifo $ctl_file, cannot auto-ban track.\n" if !-e $ctl_file;
+        open my $ctf, '>>', $ctl_file;
+        print $ctf '-';
+        close $ctf;
+        exit;
+    }
+    #print "$rec->{detailUrl}";
+    $rec->{artistUrl} = $rec->{detailUrl};
+    $rec->{artistUrl} =~ s/\/song\/([^\/]+)\/.*/\/artist\/$1/;
+    #show useful link, song links are most likely useless.
+    #TODO: try making a link for album - hard due to pandora rewriting rules
+    print "|>  $rec->{artistUrl}\n";
+    mkdir $cover_art_dir if !-d $cover_art_dir;
+    my ($fn) = $rec->{coverArt} =~ m/([^\/]+)$/;
+    $fn ||= '';
+    my $album_image = "$cover_art_dir/$fn";
+    if ($fn) {
+        #allow $max_image_wait sec to retrieve image
+        eval {
+            local $SIG{'ALRM'} = sub { die 'timeout'; };
+            alarm $max_image_wait;
+            my $ua   = new LWP::UserAgent;
+            my $img  = $ua->get($rec->{coverArt})->content;
+            if ($img && !-e $album_image && !-d $album_image) {
+                open my $fh, '>', $album_image or warn "Can't open $album_image: $!";
+                print $fh $img;
+                close $fh;
+            }
+        };
+        alarm 0;
+    }
+    #quandary here
+    #$rec->{rating} == 2 is true and would return '++', but should also never play
+    $rec->{rating} = $rec->{rating} ? '++' : '';
+    $album_image = $default_image if !$fn || !-e $album_image || -d $album_image;
+    #escape quotes so that the growlnotify command works
+    for (qw(title artist album)) {
+        $rec->{$_} =~ s/"/\\"/g;
+    }
+    `growlnotify -d 12 -t "$rec->{title}$rec->{rating}" --image "$album_image" -m "$rec->{artist}\n($rec->{album})"`;
+}
