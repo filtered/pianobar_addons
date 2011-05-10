@@ -25,7 +25,7 @@ my $max_album_bans = 2;
 #maximum number of seconds to wait for album art download
 my $max_image_wait = 2;
 #regex autoban for match in artist, track, or title
-my $auto_ban_regex = qr/(dubstep|steppahs)/i;
+my $auto_ban_regex = qr/(dubstep|steppahs|global hardcore)/i;
 
 my $rec; #record passed from pianobar
 my @args           = @ARGV;
@@ -94,7 +94,7 @@ if ($rec->{action} =~ /^song(ban|love)/) {
     my $averages_string = "Averages:\n\tBanned: $avg->{ban}\n\tLoved:  $avg->{love}\n\n\n";
     my $wkdayavg_string = "Workday Averages:\n\tBanned: $avg->{workban}\n\tLoved:  $avg->{worklove}\n\n\n";
     my $song = "$rec->{title} : $rec->{artist}";
-    $song =~ s/\n//g;
+    $song =~ s/"/\\"/g;
     #TODO avg time elapsed to ban/love song?
     `growlnotify -d 12 -t "$action $song" --image "$default_image" -m "$today_string$all_time_string$averages_string$wkdayavg_string"`;
 }
