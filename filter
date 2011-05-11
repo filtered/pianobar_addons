@@ -26,6 +26,11 @@ my $max_album_bans = 2;
 my $max_image_wait = 2;
 #regex autoban for match in artist, track, or title
 my $auto_ban_regex = qr/(dubstep|steppahs|global hardcore)/i;
+#last.fm login information for scrobbling
+my $lastfm_username = '';
+my $lastfm_password = '';
+#minimum percentage for non-banned song to be played for scrobbling
+my $scrobble_percent = .75;
 
 my $rec; #record passed from pianobar
 my @args           = @ARGV;
@@ -111,6 +116,27 @@ if ($rec->{action} eq 'userlogin') {
     closedir $dh;
 }
 #TODO add scrobble support
+if ($rec->{action} eq 'songfinish') {
+    if ($rec->{songDuration} && (($rec->{songPlayed}/$rec->{songDuration}) > $scrobble_percent) && $rec->{'rating'} != 2) {
+        eval {
+            require Audio::Scrobbler;
+            my $scrob = Audio::Scrobbler->new(cfg => {
+                username => $lastfm_username,
+                password => $lastfm_password,
+                progname => 'pia',
+                progver  => '1.0',
+            }) or die "Couldn't new up Scrobbler\n";
+            $scrob->handshake() or die "Scrobbler handshake: ".$scrob->err()."\n";
+            $scrob->submit({
+                artist => $rec->{artist},
+                album  => $rec->{album},
+                title  => $rec->{title},
+                length => int($rec->{songDuration}/1000),
+            }) or die "Scrobbler submit: ".$scrob->err()."\n";
+        };
+        print "Scrobbling error: $@\n" if $@;
+    }
+}
 if ($rec->{action} eq 'songstart') {
     my $ban = 0;
     for (qw(artist title album)) {
