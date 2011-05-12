@@ -1,1 +1,14 @@
-I did this myself.
+Wishlist:
+
+- Growl action on click (with cocoa?)
+    - Open artist page?
+    - Open Last FM page?
+    - Ban?
+    - Love?
+    - Config option?
+- Artist bio information
+    - in growl nofitication?
+    - in terminal?
+- Address album namespace collision with autoban
+    - common names could be an issue
+    - would be simple if there were an album id of some kind from pandora
