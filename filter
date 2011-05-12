@@ -21,24 +21,24 @@ while (my $line = readline $cfh) {
 close $cfh;
 
 #the fifo named pipe file - must remain unchanged (I think)
-my $ctl_file       = "$pb_config_dir/ctl";
+my $ctl_file         = "$pb_config_dir/ctl";
 #location to store album art
-my $cover_art_dir  = $config_vars->{cover_art_dir} || "$pb_config_dir/art";
+my $cover_art_dir    = $config_vars->{cover_art_dir}    || "$pb_config_dir/art";
 #sqlite database file
-my $dbf            = $config_vars->{sqlite3_db} || "$pb_config_dir/pandora";
+my $dbf              = $config_vars->{sqlite3_db}       || "$pb_config_dir/pandora";
 #failover/default image for growl notifications
-my $default_image  = $config_vars->{default_image} || "$pb_config_dir/pandora.png";
+my $default_image    = $config_vars->{default_image}    || "$pb_config_dir/pandora.png";
 #delete album art older than
-my $max_cache_days = $config_vars->{max_cache_days} || 30;
+my $max_cache_days   = $config_vars->{max_cache_days}   || 30;
 #autoban tracks from the same album after $max_album_bans (exclusive)
-my $max_album_bans = $config_vars->{max_album_bans} || 2;
+my $max_album_bans   = $config_vars->{max_album_bans}   || 2;
 #maximum number of seconds to wait for album art download
-my $max_image_wait = $config_vars->{max_image_wait} || 2;
+my $max_image_wait   = $config_vars->{max_image_wait}   || 2;
 #regex autoban for match in artist, track, or title
-my $auto_ban_regex = $config_vars->{auto_ban_regex} ? qr/($config_vars->{auto_ban_regex})/i : qr/(bad music regex|other bad music regex)/i;
+my $auto_ban_regex   = $config_vars->{auto_ban_regex} ? qr/($config_vars->{auto_ban_regex})/i : qr/(bad music regex|other bad music regex)/i;
 #last.fm login information for scrobbling
-my $lastfm_username = $config_vars->{lastfm_username};
-my $lastfm_password = $config_vars->{lastfm_password};
+my $lastfm_username  = $config_vars->{lastfm_username};
+my $lastfm_password  = $config_vars->{lastfm_password};
 #minimum percentage for non-banned song to be played for scrobbling
 my $scrobble_percent = $config_vars->{scrobble_percent} || .75;
 
@@ -75,47 +75,84 @@ if (!$table_exists) {
 
 my $sql = "INSERT INTO log (action, artist, title, album, station, played, duration, delay, rating, date_entry)
                     VALUES (?,      ?,      ?,     ?,     ?,       ?,      ?,        ?,     ?,      current_timestamp)";
-my $count = $dbh->selectrow_array("SELECT count(*) from log");
-my $sth = $dbh->prepare($sql);
-$sth->execute(map {$rec->{$_}} qw(action artist title album stationName songPlayed songDuration delay rating));
+
+my $sth   = $dbh->prepare($sql);
+my $absql = "SELECT COUNT(*)
+               FROM log
+              WHERE title    = ?
+                AND artist   = ?
+                AND album    = ?
+                AND duration = ?
+                AND action   = 'autoban'";
+my $auto_banned = $dbh->selectrow_array($absql, undef, map {$rec->{$_}} qw(title artist album songDuration));
+$sth->execute(map {$rec->{$_}} qw(action artist title album stationName songPlayed songDuration delay rating)) if $rec->{action} ne 'songban' || !$auto_banned;
 if ($rec->{action} =~ /^song(ban|love)/) {
-    my $avg_sql = "SELECT SUM(CASE WHEN action='songban' THEN 1 ELSE 0 END)/(julianday(Datetime('now')) - julianday(MIN(date_entry))) ban,
+    my $avg_sql = "SELECT SUM(CASE WHEN action='songban'  THEN 1 ELSE 0 END)/(julianday(Datetime('now')) - julianday(MIN(date_entry))) ban,
+                          SUM(CASE WHEN action='autoban'  THEN 1 ELSE 0 END)/(julianday(Datetime('now')) - julianday(MIN(date_entry))) autoban,
                           SUM(CASE WHEN action='songlove' THEN 1 ELSE 0 END)/(julianday(Datetime('now')) - julianday(MIN(date_entry))) love
                      FROM log";
     my $dt_sql  = "SELECT COUNT(*) num, action
                      FROM log
                     WHERE date_entry LIKE Date('now')||'%'
-                      AND action IN('songban','songlove')
                  GROUP BY action";
     my $at_sql  = "SELECT COUNT (*) num, action
+                     FROM log
+                 GROUP BY action";
+    my $dur_sql = "SELECT AVG(played) time, action
+                     FROM log
+                    WHERE date_entry LIKE Date('now')||'%'
+                 GROUP BY action";
+    my $atd_sql = "SELECT AVG(played) time, action
                      FROM log
                  GROUP BY action";
     my $avg = $dbh->selectrow_hashref($avg_sql);
     my $dt  = $dbh->selectall_hashref($dt_sql,'action');
     my $at  = $dbh->selectall_hashref($at_sql,'action');
+    my $dur = $dbh->selectall_hashref($dur_sql,'action');
+    my $atd = $dbh->selectall_hashref($atd_sql,'action');
     #workday averages
-    $avg->{workban}  = ($avg->{ban} ||0)*7/5;
-    $avg->{worklove} = ($avg->{love}||0)*7/5;
-    for (qw(ban love workban worklove)) {
+    $avg->{workban}     = ($avg->{ban} ||0)*7/5;
+    $avg->{worklove}    = ($avg->{love}||0)*7/5;
+    $avg->{workautoban} = ($avg->{autoban} ||0)*7/5;
+    for (qw(ban love workban worklove autoban workautoban)) {
         $avg->{$_} = sprintf '%.02f', $avg->{$_};
     }
-    for (qw(songban songlove)) {
+    for (qw(songban songlove autoban)) {
         $dt->{$_}->{num} ||= 0;
         $at->{$_}->{num} ||= 0;
+        $dur->{$_}->{time} ||= 0;
+        $atd->{$_}->{time} ||= 0;
     }
+    for my $action (keys %$dur) {
+        $dur->{$action} = int $dur->{$action}->{time}/1000;
+    }
+    for my $action (keys %$atd) {
+        $atd->{$action} = int $atd->{$action}->{time}/1000;
+    }
+    $dt->{totalban}->{num} = $dt->{songban}->{num} + $dt->{autoban}->{num};
+    $at->{totalban}->{num} = $at->{songban}->{num} + $at->{autoban}->{num};
     my $action = $rec->{rating} && $rec->{rating} == 1 ? '++' : ' --';
-    my $today_string    = "Today:\n\tBanned: $dt->{songban}->{num}\n\tLoved:  $dt->{songlove}->{num}\n\n\n";
-    my $all_time_string = "All Time:\n\tBanned: $at->{songban}->{num}\n\tLoved:  $at->{songlove}->{num}\n\n\n";
-    my $averages_string = "Averages:\n\tBanned: $avg->{ban}\n\tLoved:  $avg->{love}\n\n\n";
-    my $wkdayavg_string = "Workday Averages:\n\tBanned: $avg->{workban}\n\tLoved:  $avg->{worklove}\n\n\n";
+    my $today_string    = "Today:\n   Banned:\t$dt->{totalban}->{num} = ($dt->{songban}->{num} + $dt->{autoban}->{num})\n   Loved:\t\t$dt->{songlove}->{num}\n\n\n";
+    my $all_time_string = "All Time:\n   Banned:\t$at->{totalban}->{num} = ($at->{songban}->{num} + $at->{autoban}->{num})\n   Loved:\t\t$at->{songlove}->{num}\n\n\n";
+    my $averages_string = "Averages:\n   Banned:\t$avg->{ban}\n   AutoBan:\t$avg->{autoban}\n   Loved:\t\t$avg->{love}\n\n\n";
+    my $wkdayavg_string = "Workday Averages:\n   Banned:\t$avg->{workban}\n   AutoBan:\t$avg->{workautoban}\n   Loved:\t\t$avg->{worklove}\n\n\n";
+    my $tdelay_string   = "Time to mark today:\n   Banned:\t$dur->{songban}sec\n   Loved:\t\t$dur->{songlove}sec\n\n\n";
+    my $atdelay_string  = "Time to mark:\n   Banned:\t$atd->{songban}sec\n   Loved:\t\t$atd->{songlove}sec\n\n\n";
     my $song = "$rec->{title} : $rec->{artist}";
     $song =~ s/"/\\"/g;
-    #TODO avg time elapsed to ban/love song?
-    `growlnotify -d 12 -t "$action $song" --image "$default_image" -m "$today_string$all_time_string$averages_string$wkdayavg_string"`;
+    `growlnotify -d 12 -t "$action $song" --image "$default_image" -m "$today_string$all_time_string$averages_string$wkdayavg_string$tdelay_string$atdelay_string"`;
 }
 
 #on login delete all album art older than $max_cache_days days
 if ($rec->{action} eq 'userlogin') {
+    if (!-e $ctl_file) {
+        `mkfifo $ctl_file`;
+        my $cfm = (-e $ctl_file)
+                ? 'Named pipe created.  Please restart pianobar to autoban tracks.'
+                : "Could not mkfifo $ctl_file - please create this file as a named pipe.";
+        print "(i) pianobar did not start with 'Control fifo at $ctl_file opened' - please restart pianobar\n";
+        print "(i) $cfm\n";
+    }
     opendir my $dh, $cover_art_dir or die "Cannot open $cover_art_dir for reading: $!";
     while (my $file = readdir $dh) {
         my $filename = "$cover_art_dir/$file";
@@ -145,7 +182,7 @@ if ($rec->{action} eq 'songfinish') {
                     length => int($rec->{songDuration}/1000),
                 }) or die "Scrobbler submit: ".$scrob->err()."\n";
             };
-            print "Scrobbling error: $@\n" if $@;
+            print "(i) Scrobbling error: $@\n" if $@;
         }
     }
 }
@@ -165,19 +202,21 @@ if ($rec->{action} eq 'songstart') {
         $track =~ s/\n//g;
         print "(i) Auto-banning $track...\n";
         if (!-e $ctl_file) {
-            `mkfifo $ctl_file`;
+            print "(i) pianobar did not start with Control fifo at $ctl_file opened - please restart pianobar\n";
+            exit;
         }
-        print "Could not mkfifo $ctl_file, cannot auto-ban track.\n" if !-e $ctl_file;
         open my $ctf, '>>', $ctl_file;
         print $ctf '-';
         close $ctf;
+        $rec->{action} = 'autoban';
+        $sth->execute(map {$rec->{$_}} qw(action artist title album stationName songPlayed songDuration delay rating));
         exit;
     }
     #print "$rec->{detailUrl}";
     $rec->{artistUrl} = $rec->{detailUrl};
     $rec->{artistUrl} =~ s/\/song\/([^\/]+)\/.*/\/artist\/$1/;
     #show useful link, song links are most likely useless.
-    #TODO: try making a link for album - hard due to pandora rewriting rules
+    #album links are impossible to determine without pulling the artist page first
     print "|>  $rec->{artistUrl}\n";
     mkdir $cover_art_dir if !-d $cover_art_dir;
     my ($fn) = $rec->{coverArt} =~ m/([^\/]+)$/;
@@ -198,9 +237,7 @@ if ($rec->{action} eq 'songstart') {
         };
         alarm 0;
     }
-    #quandary here
-    #$rec->{rating} == 2 is true and would return '++', but should also never play
-    $rec->{rating} = $rec->{rating} ? '++' : '';
+    $rec->{rating} = $rec->{rating} && $rec->{rating} == 1 ? '++' : '';
     $album_image = $default_image if !$fn || !-e $album_image || -d $album_image;
     #escape quotes so that the growlnotify command works
     for (qw(title artist album)) {
