@@ -9,9 +9,7 @@ Wishlist:
 - Artist bio information
     - in growl nofitication?
     - in terminal?
-- Address album namespace collision with autoban
-    - common names could be an issue
-    - would be simple if there were an album id of some kind from pandora
+    - may require other user input
 - Last FM integration
     - Integrate API where it makes sense (http://www.last.fm/api)
     - Link Track.ban and Track.love up to the pandora actions
