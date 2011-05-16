@@ -1,0 +1,9 @@
+user = USERNAME@SERVER.TLD
+password = PASSWORD
+autostart_station = 01234567890123456
+history = 50
+event_command = /Users/USERNAME/.config/pianobar/filter
+lastfm_user = LASTFM_USERNAME
+lastfm_password = LASTFM_PASSWORD
+scrobble_percent = 1.75
+auto_ban_regex = dubstep| volume | vol.| vol 

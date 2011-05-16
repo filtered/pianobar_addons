@@ -14,8 +14,9 @@ my $config_file    = "$pb_config_dir/config";
 my $config_vars    = {};
 open my $cfh, '<', $config_file or warn "Cannot open $config_file for reading (using defaults)!";
 while (my $line = readline $cfh) {
+    next if !$line;
     my ($key, $value) = split / = /, $line;
-    chomp $value;
+    chomp $value if $value;
     $config_vars->{$key} = $value;
 }
 close $cfh;
@@ -43,6 +44,7 @@ my $lastfm_password  = $config_vars->{lastfm_password};
 my $scrobble_percent = $config_vars->{scrobble_percent} || .75;
 
 my $rec; #record passed from pianobar
+my $ua             = new LWP::UserAgent;
 my @args           = @ARGV;
 my @lines          = <STDIN>;
 my $actionline     = shift @args;
@@ -59,22 +61,65 @@ for (@lines) {
 }
 
 $rec->{delay} = eval{$rec->{songDuration}-$rec->{songPlayed}} || 0;
-
-my $dbh = DBI->connect("dbi:SQLite:dbname=$dbf","","");
-my $cts = "SELECT COUNT(*)
-             FROM sqlite_master
-            WHERE type='table'
-              AND name='log'";
-my $table_exists = $dbh->selectrow_array($cts);
-if (!$table_exists) {
-    my $create_table_sql = "CREATE TABLE log (action varchar(50), artist varchar, title varchar, album varchar,
-                                              station varchar(100), played int(11), duration int(11),
-                                              delay int(11), rating int(11), date_entry timestamp)";
-    $dbh->do($create_table_sql);
+$rec->{artistUrl} = $rec->{detailUrl};
+$rec->{artistUrl} =~ s/\/song\/([^\/]+)\/.*/\/artist\/$1/;
+my $scont = $ua->get($rec->{detailUrl})->content;
+($rec->{albumUrl}) = $scont =~ m/id="album">\s+<a[^>]+href="([^"]+)"/;
+my $pandora_url_prefix = 'http://www.pandora.com/music/';
+for (qw(detailUrl artistUrl albumUrl)) {
+    $rec->{$_} =~ s/^$pandora_url_prefix// if $rec->{$_};
 }
 
-my $sql = "INSERT INTO log (action, artist, title, album, station, played, duration, delay, rating, date_entry)
-                    VALUES (?,      ?,      ?,     ?,     ?,       ?,      ?,        ?,     ?,      current_timestamp)";
+
+my $dbh = DBI->connect("dbi:SQLite:dbname=$dbf","","");
+
+# on login only (minimal impact on total operating cost)
+# check sqlite3 database/table status
+# delete all album art older than $max_cache_days days
+if ($rec->{action} eq 'userlogin') {
+    my $cts = "SELECT COUNT(*)
+                 FROM sqlite_master
+                WHERE type='table'
+                  AND name='log'";
+    my $table_exists = $dbh->selectrow_array($cts);
+    #create missing table
+    if (!$table_exists) {
+        my $create_table_sql = "CREATE TABLE log (action varchar(50), artist varchar, title varchar, album varchar,
+                                                  station varchar(100), played int(11), duration int(11),
+                                                  delay int(11), rating int(11), date_entry timestamp,
+                                                  song_url varchar(100), album_url varchar(100),
+                                                  artist_url varchar(100))";
+        $dbh->do($create_table_sql);
+    }
+    #update old table
+    my $schsth = $dbh->table_info('%','%','log');
+    my $schema = $dbh->selectrow_hashref($schsth)->{'sqlite_sql'};
+    if ($schema !~ /(song|artist|album)_url/) {
+        print "(i) Updating database table ...\n";
+        for my $url (qw(song_url album_url artist_url)) {
+            $dbh->do("ALTER TABLE log ADD COLUMN $url varchar(100)");
+        }
+    }
+    if (!-e $ctl_file) {
+        `mkfifo $ctl_file`;
+        my $cfm = (-e $ctl_file)
+                ? 'Named pipe created.  Please restart pianobar to autoban tracks.'
+                : "Could not mkfifo $ctl_file - please create this file as a named pipe.";
+        print "(i) pianobar did not start with 'Control fifo at $ctl_file opened' - please restart pianobar\n";
+        print "(i) $cfm\n";
+    }
+    opendir my $dh, $cover_art_dir or die "Cannot open $cover_art_dir for reading: $!";
+    while (my $file = readdir $dh) {
+        my $filename = "$cover_art_dir/$file";
+        next if !-f $filename || time - (stat _)[10] < (86400 * $max_cache_days);
+        my $t = (stat _)[10];
+        unlink $filename;
+    }
+    closedir $dh;
+}
+
+my $sql = "INSERT INTO log (action, artist, title, album, station, played, duration, delay, rating, date_entry,        song_url, album_url, artist_url)
+                    VALUES (?,      ?,      ?,     ?,     ?,       ?,      ?,        ?,     ?,      current_timestamp, ?,        ?,        ?)";
 
 my $sth   = $dbh->prepare($sql);
 my $absql = "SELECT COUNT(*)
@@ -85,7 +130,7 @@ my $absql = "SELECT COUNT(*)
                 AND duration = ?
                 AND action   = 'autoban'";
 my $auto_banned = $dbh->selectrow_array($absql, undef, map {$rec->{$_}} qw(title artist album songDuration));
-$sth->execute(map {$rec->{$_}} qw(action artist title album stationName songPlayed songDuration delay rating)) if $rec->{action} ne 'songban' || !$auto_banned;
+$sth->execute(map {$rec->{$_}} qw(action artist title album stationName songPlayed songDuration delay rating detailUrl artistUrl albumUrl)) if $rec->{action} ne 'songban' || !$auto_banned;
 if ($rec->{action} =~ /^song(ban|love)/) {
     my $avg_sql = "SELECT SUM(CASE WHEN action='songban'  THEN 1 ELSE 0 END)/(julianday(Datetime('now')) - julianday(MIN(date_entry))) ban,
                           SUM(CASE WHEN action='autoban'  THEN 1 ELSE 0 END)/(julianday(Datetime('now')) - julianday(MIN(date_entry))) autoban,
@@ -143,25 +188,6 @@ if ($rec->{action} =~ /^song(ban|love)/) {
     `growlnotify -d 12 -t "$action $song" --image "$default_image" -m "$today_string$all_time_string$averages_string$wkdayavg_string$tdelay_string$atdelay_string"`;
 }
 
-#on login delete all album art older than $max_cache_days days
-if ($rec->{action} eq 'userlogin') {
-    if (!-e $ctl_file) {
-        `mkfifo $ctl_file`;
-        my $cfm = (-e $ctl_file)
-                ? 'Named pipe created.  Please restart pianobar to autoban tracks.'
-                : "Could not mkfifo $ctl_file - please create this file as a named pipe.";
-        print "(i) pianobar did not start with 'Control fifo at $ctl_file opened' - please restart pianobar\n";
-        print "(i) $cfm\n";
-    }
-    opendir my $dh, $cover_art_dir or die "Cannot open $cover_art_dir for reading: $!";
-    while (my $file = readdir $dh) {
-        my $filename = "$cover_art_dir/$file";
-        next if !-f $filename || time - (stat _)[10] < (86400 * $max_cache_days);
-        my $t = (stat _)[10];
-        unlink $filename;
-    }
-    closedir $dh;
-}
 #TODO add scrobble support
 if ($rec->{action} eq 'songfinish') {
     if ($rec->{songDuration} && (($rec->{songPlayed}/$rec->{songDuration}) > $scrobble_percent) && $rec->{'rating'} != 2) {
@@ -187,16 +213,27 @@ if ($rec->{action} eq 'songfinish') {
     }
 }
 if ($rec->{action} eq 'songstart') {
-    my $ban = 0;
+    #show useful link, song links are most likely useless.
+    print "|>  $pandora_url_prefix$rec->{artistUrl}\n";
+    #print "|>  $pandora_url_prefix$rec->{albumUrl}\n";
+    my $ban   = 0;
     for (qw(artist title album)) {
         $ban = 1 if $rec->{$_} =~ /$auto_ban_regex/;
     }
     my $absql = "SELECT COUNT(*)
                    FROM log
                   WHERE action='songban'
-                    AND album = ?";
-    my $album_bans = $dbh->selectrow_array($absql, undef, $rec->{album});
-    $ban = $album_bans if $album_bans > $max_album_bans;
+                    AND album = ?
+                    AND album_url = ?";
+    my $nbsql = "SELECT COUNT(*)
+                   FROM log
+                  WHERE (action='songlove' OR rating = 1)
+                    AND album = ?
+                    AND album_url = ?";
+    my $album_love = $dbh->selectrow_array($nbsql, undef, $rec->{album}, $rec->{albumUrl});
+    my $album_bans = 0;
+    $album_bans    = $dbh->selectrow_array($absql, undef, $rec->{album}, $rec->{albumUrl}) if !$album_love;
+    $ban           = $album_bans if $album_bans > $max_album_bans;
     if ($ban) {
         my $track = "$rec->{title} - $rec->{artist}";
         $track =~ s/\n//g;
@@ -209,15 +246,9 @@ if ($rec->{action} eq 'songstart') {
         print $ctf '-';
         close $ctf;
         $rec->{action} = 'autoban';
-        $sth->execute(map {$rec->{$_}} qw(action artist title album stationName songPlayed songDuration delay rating));
+        $sth->execute(map {$rec->{$_}} qw(action artist title album stationName songPlayed songDuration delay rating detailUrl artistUrl albumUrl));
         exit;
     }
-    #print "$rec->{detailUrl}";
-    $rec->{artistUrl} = $rec->{detailUrl};
-    $rec->{artistUrl} =~ s/\/song\/([^\/]+)\/.*/\/artist\/$1/;
-    #show useful link, song links are most likely useless.
-    #album links are impossible to determine without pulling the artist page first
-    print "|>  $rec->{artistUrl}\n";
     mkdir $cover_art_dir if !-d $cover_art_dir;
     my ($fn) = $rec->{coverArt} =~ m/([^\/]+)$/;
     $fn ||= '';
@@ -227,7 +258,6 @@ if ($rec->{action} eq 'songstart') {
         eval {
             local $SIG{'ALRM'} = sub { die 'timeout'; };
             alarm $max_image_wait;
-            my $ua   = new LWP::UserAgent;
             my $img  = $ua->get($rec->{coverArt})->content;
             if ($img && !-e $album_image && !-d $album_image) {
                 open my $fh, '>', $album_image or warn "Can't open $album_image: $!";
