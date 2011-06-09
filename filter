@@ -242,11 +242,11 @@ if ($rec->{action} eq 'songstart') {
             print "(i) pianobar did not start with Control fifo at $ctl_file opened - please restart pianobar\n";
             exit;
         }
+        $rec->{action} = 'autoban';
+        $sth->execute(map {$rec->{$_}} qw(action artist title album stationName songPlayed songDuration delay rating detailUrl artistUrl albumUrl));
         open my $ctf, '>>', $ctl_file;
         print $ctf '-';
         close $ctf;
-        $rec->{action} = 'autoban';
-        $sth->execute(map {$rec->{$_}} qw(action artist title album stationName songPlayed songDuration delay rating detailUrl artistUrl albumUrl));
         exit;
     }
     mkdir $cover_art_dir if !-d $cover_art_dir;
